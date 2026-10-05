@@ -12,8 +12,10 @@ import type {
 } from './types';
 
 export interface Drift {
+  kind: 'versionChanged' | 'templateChanged';
   expected: number | null;
   actual: number;
+  duringApply: boolean; // a lock was held when the load happened; flagged, not suppressed
 }
 
 export interface ReduceResult {
@@ -32,7 +34,7 @@ export function reduce(row: IndexRow, event: IndexEvent, inProgressTimeoutMs: nu
     case 'EngagementCreated':
       return { row: onCreated(row, event) };
     case 'EngagementLoaded':
-      return onLoaded(row, event);
+      return onLoaded(row, event, inProgressTimeoutMs);
     case 'ApplyRequested':
       return { row: onApplyRequested(row, event, inProgressTimeoutMs) };
     case 'ApplySucceeded':
@@ -55,6 +57,11 @@ function isLocked(row: IndexRow, at: number, timeoutMs: number): boolean {
   return row.inProgress !== null && !isLockExpired(row.inProgress.since, at, timeoutMs);
 }
 
+// Like isLocked, but an event that happened before the lock started was not racing it.
+function isLockHeldAt(row: IndexRow, at: number, timeoutMs: number): boolean {
+  return row.inProgress !== null && at >= row.inProgress.since && isLocked(row, at, timeoutMs);
+}
+
 function onCreated(row: IndexRow, event: EngagementCreated): IndexRow {
   // Out-of-order: a create/restore older than the last version or lifecycle change.
   if (isStale(row, event.occurredAt)) return row;
@@ -69,20 +76,28 @@ function onCreated(row: IndexRow, event: EngagementCreated): IndexRow {
   };
 }
 
-function onLoaded(row: IndexRow, event: EngagementLoaded): ReduceResult {
+function onLoaded(row: IndexRow, event: EngagementLoaded, timeoutMs: number): ReduceResult {
   // Stale: a load that started before an apply finished reports the old version.
   if (isStale(row, event.occurredAt)) return { row };
+  const templateChanged = row.templateId !== null && event.templateId !== row.templateId;
   // Duplicate or no drift: the file matches what the index already believes.
-  if (event.version === row.currentVersion) return { row };
-  // Never touches declinedThroughVersion: the file does not know about declines.
+  if (!templateChanged && event.version === row.currentVersion) return { row };
   return {
     row: {
       ...row,
       templateId: event.templateId,
       currentVersion: event.version,
       versionObservedAt: event.occurredAt,
+      // Deliberate exception to rule 7: declines were made against the old template's
+      // versions and mean nothing for the new one. Same-template drift never touches them.
+      declinedThroughVersion: templateChanged ? 0 : row.declinedThroughVersion,
     },
-    drift: { expected: row.currentVersion, actual: event.version },
+    drift: {
+      kind: templateChanged ? 'templateChanged' : 'versionChanged',
+      expected: row.currentVersion,
+      actual: event.version,
+      duringApply: isLockHeldAt(row, event.occurredAt, timeoutMs),
+    },
   };
 }
 
@@ -95,8 +110,11 @@ function onApplyRequested(row: IndexRow, event: ApplyRequested, timeoutMs: numbe
 }
 
 function onApplySucceeded(row: IndexRow, event: ApplySucceeded): IndexRow {
-  // Race: a load already reported `to` before this success arrived; only the lock is left to clear.
+  // Race: a load already reported `to` before this success arrived; only the lock is left
+  // to clear. Checked before isStale, because that load is usually newer than the success.
   if (event.to === row.currentVersion) return clearLockStartedBy(row, event.occurredAt);
+  // Out-of-order: an old success redelivered after a newer restore or load.
+  if (isStale(row, event.occurredAt)) return row;
   // Out-of-order: from no longer matches the version the row is on.
   // Deliberately not gated by the lock, so a late success after expiry still lands.
   if (event.from !== row.currentVersion) return row;
@@ -128,8 +146,7 @@ function onApplyFailed(row: IndexRow, event: ApplyFailed): IndexRow {
 function onDeclined(row: IndexRow, event: Declined, timeoutMs: number): IndexRow {
   // Race: another user is applying; declining during it would contradict that apply.
   // A decline that happened before the apply started is delivered late, not racing, so it is kept.
-  const startedBeforeLock = row.inProgress !== null && event.occurredAt < row.inProgress.since;
-  if (!startedBeforeLock && isLocked(row, event.occurredAt, timeoutMs)) return row;
+  if (isLockHeldAt(row, event.occurredAt, timeoutMs)) return row;
   // Out-of-order: decline of versions the row has already moved past.
   // When currentVersion is unknown the decline is kept; the UI never offers decline
   // on unknown rows, so this only happens via a late or replayed event.
@@ -142,5 +159,6 @@ function onDeclined(row: IndexRow, event: Declined, timeoutMs: number): IndexRow
 function onRemoved(row: IndexRow, event: EngagementRemoved): IndexRow {
   // Out-of-order: a removal older than a restore that has already been applied.
   if (isStale(row, event.occurredAt)) return row;
-  return { ...row, removed: true, versionObservedAt: event.occurredAt };
+  // The lock is cleared: no apply can finish on a removed file, and a restore must not inherit it.
+  return { ...row, removed: true, inProgress: null, versionObservedAt: event.occurredAt };
 }

@@ -28,7 +28,11 @@ npx tsc --noEmit    # strict typecheck (vitest does not typecheck)
 4. **`Declined` on an unknown row is recorded.** The UI never offers decline on unknown rows, so this only happens through a late or replayed event, and dropping it would lose a decline.
 5. **Bulk groups are sorted by `templateId` ascending, then `from` descending.** The real UI sorts by template display name.
 6. **Only declines made *during* a lock are dropped.** A `Declined` with `occurredAt < inProgress.since` happened before the apply started and was merely delivered late, so it is recorded. It survives an `ApplyFailed`. A successful apply resets it to 0 as usual.
-7. **`ApplySucceeded` with `currentVersion === to` clears `inProgress`.** This covers a load that reported the new version before the success message arrived. It is still idempotent: once the lock is clear, a redelivered success is a no-op.
+7. **`ApplySucceeded` runs three checks in order.** (1) If `currentVersion === to`, it clears `inProgress` only, even when the event is stale. This covers a load that reported the new version before the success arrived, and is idempotent: once the lock is clear, a redelivered success is a no-op. (2) If `isStale`, it is ignored, which stops an old success from re-applying after a restore. (3) If `from === currentVersion`, it applies.
+8. **Drift carries `duringApply: boolean`.** It is `true` when a lock was held at the load's `occurredAt` and the load happened at or after the lock started. Drift is flagged, never suppressed.
+9. **`EngagementLoaded` with a different `templateId` is accepted.** It resets `declinedThroughVersion` to 0 and reports `drift.kind = 'templateChanged'` (otherwise `'versionChanged'`). This is a deliberate exception to rule 7, commented in code: declines refer to the old template's versions.
+10. **`templateUnknown` status.** A template missing from the store is reported as `templateUnknown`, not `upToDate`. `groupForBulk` lists these rows in `templateUnknownIds` and never in groups.
+11. **`EngagementRemoved` clears `inProgress`.**
 
 ## Assumptions (not in the original spec)
 
@@ -36,9 +40,11 @@ npx tsc --noEmit    # strict typecheck (vitest does not typecheck)
 - `Status` is in `types.ts` because two modules use it. The bulk and coverage types live next to the functions that use them. `latestByTemplate` is a `ReadonlyMap`, so a missing template is honestly typed as `undefined`.
 - **Equal timestamps are not stale.** `isStale` uses `occurredAt < versionObservedAt`. Re-applying an event with the same timestamp writes the same values again, so it is idempotent.
 - `EngagementLoaded` with the same version is a complete no-op and does not move `versionObservedAt` forward.
-- `deriveStatus` checks in this order: removed, unknown, template unknown to the store (→ `upToDate`), active lock (→ `inProgress`), `upToDate`, `declined`, `pending`.
-- Decision 7 only clears a lock that started at or before the success's `occurredAt`. Without this, a redelivered old `ApplySucceeded{3→7}` would clear the lock of a *newer* apply (7→9) running on the same row. It has its own test.
-- Decision 7 clears only the lock. It does not reset `declinedThroughVersion`. Any decline left over is at or below `to`, so max() in the reference point makes it harmless.
+- `deriveStatus` checks in this order: removed, unknown, `templateUnknown`, active lock (→ `inProgress`), `upToDate`, `declined`, `pending`. An unknown row whose template is also missing from the store is `unknown`.
+- `duringApply` and late declines use the same helper, `isLockHeldAt`: lock present, event at or after `since`, not expired. `ApplyRequested` keeps the plain `isLocked` check.
+- `templateChanged` leaves `inProgress` alone. Drift reports versions only, not template ids.
+- Decision 7, check 1 only clears a lock that started at or before the success's `occurredAt`. Without this, a redelivered old `ApplySucceeded{3→7}` would clear the lock of a *newer* apply (7→9) running on the same row. It has its own test.
+- Decision 7, check 1 clears only the lock. It does not reset `declinedThroughVersion`. Any decline left over is at or below `to`, so max() in the reference point makes it harmless.
 - `groupForBulk` groups by `(templateId, from)`. A group can contain only `inProgressIds`. `unknownIds` keep input order.
 - `bulkDecline` uses `now` as each event's `occurredAt`.
 - `checkCoverage` removes duplicate ids and keeps first-seen order. An empty diff with no references counts as covered.
@@ -46,11 +52,7 @@ npx tsc --noEmit    # strict typecheck (vitest does not typecheck)
 
 ## Open questions (not built)
 
-1. **`ApplySucceeded` has no timestamp guard.** Suppose an engagement is restored back to v3 after an apply 3→7, and then the old `ApplySucceeded{3→7}` is redelivered. It matches `from === currentVersion` and re-applies. Adding `isStale` to that branch would close this.
-2. **Suppress drift while locked.** A load that reports the apply's result before `ApplySucceeded` arrives (`EngagementLoaded{7}` during apply 3→7) raises a false drift alarm. The lock part is fixed (decision 7). Whether to suppress or tag drift while a lock is held is still open.
-3. **`ApplyRequested` delivered after its own `ApplyFailed`** takes the lock again until the timeout. Requests have no id that would let us match them to their outcome.
-4. **Clock skew.** `occurredAt` comes from different producers: the engagement system, the apply worker and the template store. Every ordering guard assumes their clocks are comparable.
-5. **The template changes under a load.** `EngagementLoaded` with a different `templateId` simply overwrites it. Is that a valid transition, or an alert?
-6. **`Declined.throughVersion` above the latest published version** is accepted without a check.
-7. **A template unknown to the store** shows as `upToDate`. A distinct `templateUnknown` status would make that state visible instead of hiding it.
-8. `EngagementRemoved` does not clear `inProgress`. After a restore, the old lock still applies until it expires.
+1. **Correlate applies with an `applyId`.** An `ApplyRequested` delivered after its own `ApplyFailed` takes the lock again until it times out. A correlation id on request, success and failure would let `reduce` recognise the late request as already finished.
+2. **Use a per-engagement revision number instead of `occurredAt`.** Every ordering guard compares timestamps from different producers: the engagement system, the apply worker and the template store. Clock skew between them can make a fresh event look stale. A monotonically increasing revision per engagement, assigned by one writer, would make ordering exact.
+3. **`Declined.throughVersion` is validated at the API boundary.** The decline endpoint rejects a `throughVersion` above the latest published version. `reduce` treats events as facts that already happened, so it does not re-validate them.
+4. **A template change during an apply.** The lock taken for the old template's apply is left in place and only clears when it times out.

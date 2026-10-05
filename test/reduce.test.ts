@@ -56,6 +56,29 @@ describe('reduce: apply', () => {
     expect(result.inProgress).toBeNull();
   });
 
+  it('ApplySucceeded older than the load that reported the new version still clears the lock', () => {
+    const row = makeRow({ versionObservedAt: 1, inProgress: { since: 5 } });
+    const events: IndexEvent[] = [
+      { type: 'EngagementLoaded', engagementId: 'e1', occurredAt: 10, templateId: 't1', version: 7 },
+      { ...succeeded, occurredAt: 9 },
+    ];
+    const result = applyAll(row, events);
+    expect(result.currentVersion).toBe(7);
+    expect(result.inProgress).toBeNull();
+  });
+
+  it('ignores an old ApplySucceeded redelivered after the engagement was restored to its from version', () => {
+    const events: IndexEvent[] = [
+      succeeded, // 3→7 at t=200
+      { type: 'EngagementRemoved', engagementId: 'e1', occurredAt: 300, reason: 'deleted' },
+      { type: 'EngagementCreated', engagementId: 'e1', occurredAt: 400, templateId: 't1', version: 3, source: 'restore' },
+      succeeded, // redelivered
+    ];
+    const result = applyAll(makeRow(), events);
+    expect(result.currentVersion).toBe(3);
+    expect(result.versionObservedAt).toBe(400);
+  });
+
   it('a redelivered old ApplySucceeded does not clear the lock of a newer apply', () => {
     const row = makeRow({ currentVersion: 7, versionObservedAt: 200, inProgress: { since: 300 } });
     expect(reduce(row, succeeded, TIMEOUT).row).toEqual(row);
@@ -132,8 +155,22 @@ describe('reduce: load (drift check)', () => {
   it('EngagementLoaded with a different version reports drift and fixes the row without touching declinedThroughVersion', () => {
     const row = makeRow({ declinedThroughVersion: 5 });
     const result = reduce(row, loaded(4, 200), TIMEOUT);
-    expect(result.drift).toEqual({ expected: 3, actual: 4 });
+    expect(result.drift).toEqual({ kind: 'versionChanged', expected: 3, actual: 4, duringApply: false });
     expect(result.row).toEqual({ ...row, currentVersion: 4, versionObservedAt: 200 });
+  });
+
+  it('flags drift seen while an apply holds the lock as duringApply instead of suppressing it', () => {
+    const row = makeRow({ inProgress: { since: 150 } });
+    const result = reduce(row, loaded(7, 200), TIMEOUT);
+    expect(result.drift).toEqual({ kind: 'versionChanged', expected: 3, actual: 7, duringApply: true });
+  });
+
+  it('EngagementLoaded with a different templateId reports templateChanged and resets declinedThroughVersion', () => {
+    const row = makeRow({ declinedThroughVersion: 5 });
+    const otherTemplate: IndexEvent = { type: 'EngagementLoaded', engagementId: 'e1', occurredAt: 200, templateId: 't2', version: 3 };
+    const result = reduce(row, otherTemplate, TIMEOUT);
+    expect(result.drift).toEqual({ kind: 'templateChanged', expected: 3, actual: 3, duringApply: false });
+    expect(result.row).toEqual({ ...row, templateId: 't2', declinedThroughVersion: 0, versionObservedAt: 200 });
   });
 
   it('EngagementLoaded with the same version reports no drift', () => {
@@ -152,7 +189,7 @@ describe('reduce: load (drift check)', () => {
 
   it('EngagementLoaded on an unknown row makes it known and reports drift with expected null', () => {
     const result = reduce(Object.freeze(emptyRow('e1')), loaded(3, 200), TIMEOUT);
-    expect(result.drift).toEqual({ expected: null, actual: 3 });
+    expect(result.drift).toEqual({ kind: 'versionChanged', expected: null, actual: 3, duringApply: false });
     expect(result.row).toMatchObject({ templateId: 't1', currentVersion: 3, versionObservedAt: 200 });
   });
 });
@@ -177,6 +214,11 @@ describe('reduce: lifecycle', () => {
       { type: 'EngagementCreated', engagementId: 'e1', occurredAt: 300, templateId: 't1', version: 3, source: 'copy' },
     ];
     expect(applyAll(removedRow, later)).toEqual(removedRow);
+  });
+
+  it('EngagementRemoved clears inProgress', () => {
+    const row = makeRow({ inProgress: { since: 150 } });
+    expect(reduce(row, removed, TIMEOUT).row.inProgress).toBeNull();
   });
 
   it('EngagementCreated from restore revives a removed row', () => {

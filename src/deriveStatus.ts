@@ -15,10 +15,9 @@ export function deriveStatus(
   if (row.removed) return { kind: 'removed' };
   if (row.currentVersion === null) return { kind: 'unknown' };
 
-  // Template unknown to the template store (not yet synced, or retired): we cannot
-  // name a target version, so offering an apply would be a guess. upToDate keeps the
-  // row out of the pending list rather than inviting an action we cannot back up.
-  if (latestVersion === undefined) return { kind: 'upToDate' };
+  // Template missing from the template store (not yet synced, or retired): we cannot
+  // name a target version, so we report that instead of guessing pending or upToDate.
+  if (latestVersion === undefined) return { kind: 'templateUnknown' };
 
   const current = row.currentVersion;
 

@@ -37,8 +37,8 @@ describe('deriveStatus', () => {
     expect(deriveStatus(makeRow({ currentVersion: 7 }), 7, NOW, TIMEOUT)).toEqual({ kind: 'upToDate' });
   });
 
-  it('returns upToDate when the template store does not know the template', () => {
-    expect(deriveStatus(makeRow(), undefined, NOW, TIMEOUT)).toEqual({ kind: 'upToDate' });
+  it('returns templateUnknown when the template store does not know the template', () => {
+    expect(deriveStatus(makeRow(), undefined, NOW, TIMEOUT)).toEqual({ kind: 'templateUnknown' });
   });
 
   it('returns inProgress while the apply is within the timeout', () => {

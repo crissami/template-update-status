@@ -12,6 +12,7 @@ export interface BulkGroup {
 export interface BulkView {
   groups: BulkGroup[]; // per template, sorted by `from` DESC (smallest diff first)
   unknownIds: EngagementId[]; // always rendered last
+  templateUnknownIds: EngagementId[]; // no latest version to group by
 }
 
 export function groupForBulk(
@@ -22,6 +23,7 @@ export function groupForBulk(
 ): BulkView {
   const groups = new Map<string, BulkGroup>();
   const unknownIds: EngagementId[] = [];
+  const templateUnknownIds: EngagementId[] = [];
 
   for (const row of rows) {
     const latest = row.templateId === null ? undefined : latestByTemplate.get(row.templateId);
@@ -29,6 +31,8 @@ export function groupForBulk(
 
     if (status.kind === 'unknown') {
       unknownIds.push(row.engagementId);
+    } else if (status.kind === 'templateUnknown') {
+      templateUnknownIds.push(row.engagementId);
     } else if ((status.kind === 'pending' || status.kind === 'inProgress') && row.templateId !== null) {
       const group = getOrCreateGroup(groups, row.templateId, status.from, status.to);
       const ids = status.kind === 'pending' ? group.declinableIds : group.inProgressIds;
@@ -37,7 +41,7 @@ export function groupForBulk(
     // removed, upToDate and declined rows are not part of the bulk view.
   }
 
-  return { groups: [...groups.values()].sort(compareGroups), unknownIds };
+  return { groups: [...groups.values()].sort(compareGroups), unknownIds, templateUnknownIds };
 }
 
 function getOrCreateGroup(groups: Map<string, BulkGroup>, templateId: TemplateId, from: number, to: number): BulkGroup {

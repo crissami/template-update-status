@@ -70,6 +70,7 @@ export type IndexEvent =
 export type Status =
   | { kind: 'removed' }
   | { kind: 'unknown' }
+  | { kind: 'templateUnknown' } // template missing from the template store
   | { kind: 'upToDate' }
   | { kind: 'declined'; through: number } // hidden from pending
   | { kind: 'pending'; from: number; to: number } // from = currentVersion, ALWAYS

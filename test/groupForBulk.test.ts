@@ -33,7 +33,18 @@ describe('groupForBulk', () => {
       makeRow('upToDate', { currentVersion: 7 }),
       makeRow('declined', { declinedThroughVersion: 7 }),
     ];
-    expect(groupForBulk(rows, LATEST, NOW, TIMEOUT)).toEqual({ groups: [], unknownIds: ['unknown'] });
+    expect(groupForBulk(rows, LATEST, NOW, TIMEOUT)).toEqual({
+      groups: [],
+      unknownIds: ['unknown'],
+      templateUnknownIds: [],
+    });
+  });
+
+  it('puts rows whose template is missing from the store in templateUnknownIds, not in groups', () => {
+    const rows = [makeRow('a'), makeRow('b', { templateId: 'retired' })];
+    const view = groupForBulk(rows, LATEST, NOW, TIMEOUT);
+    expect(view.templateUnknownIds).toEqual(['b']);
+    expect(view.groups.flatMap((g) => g.declinableIds)).toEqual(['a']);
   });
 
   it('orders groups by templateId, then by from descending within a template', () => {
